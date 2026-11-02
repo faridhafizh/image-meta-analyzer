@@ -1,22 +1,49 @@
-# Image Metadata Security Analyzer
+# 🛡️ Image Metadata Security Analyzer
 
-A command-line tool written in **Rust** that extracts and audits EXIF/metadata from image files, flagging potential **privacy and security risks**.
+[![Rust](https://img.shields.io/badge/Rust-2021_edition-orange?logo=rust)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CLI](https://img.shields.io/badge/type-CLI-lightgrey)](#usage)
+
+A high-performance command-line tool written in **Rust** that extracts and audits EXIF/metadata from image files and flags potential **privacy and security risks**: GPS location, device serial numbers, personal data, software fingerprints, and more.
+
+Every finding is assigned a severity from **Info → Low → Medium → High → Critical** together with a concrete remediation recommendation.
+
+---
+
+## Table of Contents
+
+- [Features](#features)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Sample Output](#sample-output)
+- [Stripping Metadata (Remediation)](#stripping-metadata-remediation)
+- [Supported Formats](#supported-formats)
+- [Project Structure](#project-structure)
+- [Dependencies](#dependencies)
+- [Contributing](#contributing)
+- [License](#license)
 
 ---
 
 ## Features
 
-| Category | What It Detects |
-|---|---|
-| 📍 Location | GPS coordinates, altitude, speed, sub-meter coordinate precision, precise maps link |
-| 🎥 Device ID | Camera make/model, serial numbers, lens info, MakerNote |
+| Category         | What It Detects                                                                                      |
+|------------------|------------------------------------------------------------------------------------------------------|
+| 📍 Location      | GPS coordinates, altitude, speed, sub-meter coordinate precision, precise maps link                  |
+| 🎥 Device ID     | Camera make/model, serial numbers, lens info, MakerNote                                              |
 | 👤 Personal Data | Artist name, user comments (including phone/email/name PII), host computer hostname, Windows XP tags |
-| 🛠 Software | Editing software fingerprint, version numbers, document names / file paths |
-| ⏰ Timing | Capture timestamp, modification timestamp, sub-24h mismatches, >24h inconsistencies |
-| 🖼 Integrity | Embedded thumbnail leak, unique image ID tracking |
-| ⚠️ Format | Anomalous file formats, suspiciously small files |
+| 🛠 Software      | Editing software fingerprint, version numbers, document names / file paths                           |
+| ⏰ Timing        | Capture timestamp, modification timestamp, sub-24h mismatches, >24h inconsistencies                  |
+| 🖼 Integrity     | Embedded thumbnail leak, unique image ID tracking                                                    |
+| ⚠️ Format        | Anomalous file formats, suspiciously small files                                                     |
 
-Each finding is assigned a severity: **Info → Low → Medium → High → Critical** with a remediation recommendation.
+Additional capabilities:
+
+- **Risk scoring**: each file gets an overall risk level and numeric score.
+- **File fingerprinting**: SHA-256 and MD5 hashes for every analyzed file.
+- **Batch analysis**: pass any number of files (or shell globs) in one run.
+- **Machine-readable output**: JSON reports with a `findings_summary` (`total`, `by_severity`, `by_category`).
+- **Actionable advice**: every finding comes with a fix you can apply right away.
 
 ---
 
@@ -24,21 +51,37 @@ Each finding is assigned a severity: **Info → Low → Medium → High → Crit
 
 ### Prerequisites
 
-- Rust toolchain (≥ 1.80): https://rustup.rs
+- Rust toolchain (stable, ≥ 1.80 recommended): <https://rustup.rs>
 
-### Build
+### Build from source
 
 ```bash
-git clone <repo>
-cd image_meta_analyzer
+git clone https://github.com/faridhafizh/image-meta-analyzer.git
+cd image-meta-analyzer
 cargo build --release
 ```
 
 The binary will be at `target/release/image_meta_analyzer`.
 
+### Run without installing
+
+```bash
+cargo run --release -- photo.jpg
+```
+
+### Optional: install to your PATH
+
+```bash
+cargo install --path .
+```
+
 ---
 
 ## Usage
+
+```
+image_meta_analyzer [OPTIONS] <FILES>...
+```
 
 ### Analyze a single image
 
@@ -64,8 +107,7 @@ The binary will be at `target/release/image_meta_analyzer`.
 ./image_meta_analyzer photo.jpg --json
 ```
 
-JSON output is a parseable array (the banner is suppressed). Each report includes a
-`findings_summary` object with `total`, `by_severity`, and `by_category` counts.
+JSON output is a parseable array (the banner is suppressed). Each report includes a `findings_summary` object with `total`, `by_severity`, and `by_category` counts.
 
 ### Save JSON report to file
 
@@ -84,6 +126,16 @@ JSON output is a parseable array (the banner is suppressed). Each report include
 ```bash
 ./image_meta_analyzer --help
 ```
+
+### Options summary
+
+| Option             | Description                                      |
+|--------------------|--------------------------------------------------|
+| `--warnings-only`  | Show only security findings, hide informational output |
+| `--json`           | Output reports as JSON (banner suppressed)       |
+| `--output <FILE>`  | Write the report to a file (use with `--json`)   |
+| `--verbose`        | Dump all raw EXIF tags                           |
+| `--help`           | Show help                                        |
 
 ---
 
@@ -125,6 +177,8 @@ JSON output is a parseable array (the banner is suppressed). Each report include
 
 ## Stripping Metadata (Remediation)
 
+The analyzer only **reads** your files; it never modifies them. To clean an image, use one of these tools:
+
 ### Remove ALL metadata
 
 ```bash
@@ -149,6 +203,8 @@ exiftool -CameraSerialNumber= -BodySerialNumber= -Artist= -HostComputer= photo.j
 convert photo.jpg -strip clean_photo.jpg
 ```
 
+> Tip: after cleaning, run the analyzer again to confirm nothing sensitive is left.
+
 ---
 
 ## Supported Formats
@@ -164,23 +220,60 @@ convert photo.jpg -strip clean_photo.jpg
 
 ---
 
+## Project Structure
+
+```
+image-meta-analyzer/
+├── src/
+│   └── main.rs        # Binary entry point (CLI, analysis, reporting)
+├── Cargo.toml         # Package manifest & dependencies
+├── Cargo.lock         # Locked dependency versions
+├── LICENSE            # MIT license
+└── README.md
+```
+
+Build artifacts are generated in `target/` by Cargo.
+
+---
+
 ## Dependencies
 
-| Crate | Purpose |
-|---|---|
-| `kamadak-exif` | EXIF tag parsing |
-| `image` | Pixel dimensions & format detection |
-| `clap` | CLI argument parsing |
-| `colored` | Terminal color output |
-| `serde` / `serde_json` | JSON report serialization |
-| `sha2` / `md-5` | File integrity hashing |
-| `chrono` | Timestamp formatting |
-| `regex` | PII and software-version pattern detection |
-| `humansize` | Human-readable file sizes |
-| `hex` | Hash hex encoding |
+| Crate                  | Purpose                                    |
+|------------------------|--------------------------------------------|
+| `kamadak-exif`         | EXIF tag parsing                           |
+| `image`                | Pixel dimensions & format detection        |
+| `clap`                 | CLI argument parsing                       |
+| `colored`              | Terminal color output                      |
+| `serde` / `serde_json` | JSON report serialization                  |
+| `sha2` / `md-5`        | File integrity hashing                     |
+| `hex`                  | Hash hex encoding                          |
+| `chrono`               | Timestamp formatting                       |
+| `regex`                | PII and software-version pattern detection |
+| `humansize`            | Human-readable file sizes                  |
+
+The release profile is optimized for speed and size (`opt-level = 3`, `strip = true`).
+
+---
+
+## Contributing
+
+Issues and pull requests are welcome.
+
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feature/my-feature`
+3. Commit your changes and push the branch
+4. Open a pull request
+
+Before submitting, please run:
+
+```bash
+cargo fmt
+cargo clippy
+cargo test
+```
 
 ---
 
 ## License
 
-MIT
+Released under the [MIT License](LICENSE).
