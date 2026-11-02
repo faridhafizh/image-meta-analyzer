@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::sync::LazyLock;
+
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::analyzer::{CameraInfo, FileInfo, GpsInfo, SoftwareInfo, TimestampInfo};
@@ -98,7 +101,7 @@ pub fn analyze(
     check_suspicious_fields(&mut findings, raw_exif);
 
     // Sort by severity (highest first)
-    findings.sort_by(|a, b| b.severity.score().cmp(&a.severity.score()));
+    findings.sort_by_key(|a| std::cmp::Reverse(a.severity.score()));
     findings
 }
 
@@ -161,6 +164,33 @@ fn check_gps(findings: &mut Vec<SecurityFinding>, gps: &Option<GpsInfo>) {
                 )),
                 recommendation: "Remove GPSDateStamp and GPSTimeStamp fields.".into(),
             });
+        }
+        // PREC-001: sub-meter coordinate resolution. The EXIF seconds component is a
+        // rational `secs/denom`; one arcsecond is ~30.9 m, so `denom >= 31` means the
+        // stored coordinate step is below one meter. Larger denominators are *more*
+        // precise, not less.
+        const SUBMETER_SECONDS_DENOM: u32 = 31;
+        if let (Some(lat_den), Some(lon_den)) = (g.latitude_denominator, g.longitude_denominator) {
+            if lat_den >= SUBMETER_SECONDS_DENOM || lon_den >= SUBMETER_SECONDS_DENOM {
+                let resolution_m = |denom: u32| 30.9 / denom as f64;
+                findings.push(SecurityFinding {
+                    id: "PREC-001".into(),
+                    severity: Severity::High,
+                    category: Category::Location,
+                    title: "Extremely Precise GPS Coordinates".into(),
+                    description: "GPS coordinates are stored with sub-meter resolution, revealing an exact location far beyond typical device accuracy.".into(),
+                    detail: Some(format!(
+                        "Seconds denominator: lat {} (~{:.2} m)  lon {} (~{:.2} m)\nLat: {:.6}  Lon: {:.6}",
+                        lat_den,
+                        resolution_m(lat_den),
+                        lon_den,
+                        resolution_m(lon_den),
+                        g.latitude,
+                        g.longitude
+                    )),
+                    recommendation: "Round GPS coordinates to lower precision or strip GPS tags entirely before sharing.".into(),
+                });
+            }
         }
     }
 }
@@ -250,9 +280,37 @@ fn check_personal_data(findings: &mut Vec<SecurityFinding>, software: &SoftwareI
                 recommendation: "Review and clear the UserComment field.".into(),
             });
         }
-    }
+        // PII-010: detect personal information patterns inside User Comment
+        let mut kinds: Vec<&str> = Vec::new();
+        let mut samples: Vec<&str> = Vec::new();
+        for (kind, found) in [
+            ("phone", PHONE_RE.find(comment)),
+            ("email", EMAIL_RE.find(comment)),
+            ("name", NAME_RE.find(comment)),
+        ] {
+            if let Some(m) = found {
+                kinds.push(kind);
+                samples.push(m.as_str());
+            }
+        }
 
-    if let Some(ref desc) = software.image_description {
+        if !samples.is_empty() {
+            findings.push(SecurityFinding {
+                id: "PII-010".into(),
+                severity: Severity::Medium,
+                category: Category::PersonalData,
+                title: "Personal Information in User Comment".into(),
+                description: "User Comment field contains personally identifiable information such as phone numbers, email addresses, or names.".into(),
+                detail: Some(format!(
+                    "Detected {} in comment: {}",
+                    kinds.join(", "),
+                    truncate(&samples.join(", "), 200)
+                )),
+                recommendation: "Clear the UserComment field before sharing the image.".into(),
+            });
+        }
+    }
+    if let Some(desc) = &software.image_description {
         if !desc.trim().is_empty() {
             findings.push(SecurityFinding {
                 id: "PII-003".into(),
@@ -305,7 +363,7 @@ fn check_personal_data(findings: &mut Vec<SecurityFinding>, software: &SoftwareI
 }
 
 fn check_software_fingerprint(findings: &mut Vec<SecurityFinding>, software: &SoftwareInfo) {
-    if let Some(ref sw) = software.software {
+    if let Some(sw) = &software.software {
         // Detect common editing software signatures
         let sw_lower = sw.to_lowercase();
         let editing_tools = ["photoshop", "lightroom", "gimp", "darktable", "capture one", "affinity", "luminar"];
@@ -330,9 +388,22 @@ fn check_software_fingerprint(findings: &mut Vec<SecurityFinding>, software: &So
             detail: Some(format!("Software: {}", sw)),
             recommendation: "Remove or anonymize the Software tag to prevent revealing your toolchain.".into(),
         });
+
+        // SW-003: version numbers expose the exact toolchain.
+        if let Some(m) = VERSION_RE.find(sw) {
+            findings.push(SecurityFinding {
+                id: "SW-003".into(),
+                severity: Severity::Low,
+                category: Category::SoftwareFingerprint,
+                title: "Software Version Detected".into(),
+                description: "The Software field contains a version number, which can indicate the exact toolchain and potential known vulnerabilities.".into(),
+                detail: Some(format!("Software: {}", m.as_str())),
+                recommendation: "Remove or anonymize the Software tag to prevent exposing version-specific details.".into(),
+            });
+        }
     }
 
-    if let Some(ref doc) = software.document_name {
+    if let Some(doc) = &software.document_name {
         findings.push(SecurityFinding {
             id: "SW-002".into(),
             severity: Severity::Medium,
@@ -373,19 +444,71 @@ fn check_timing(findings: &mut Vec<SecurityFinding>, timestamps: &TimestampInfo)
         });
     }
 
-    // Detect timestamp inconsistency (possible manipulation indicator)
-    if let (Some(ref orig), Some(ref modified)) = (&timestamps.datetime_original, &timestamps.datetime_modified) {
-        if orig != modified {
-            findings.push(SecurityFinding {
-                id: "TIME-003".into(),
-                severity: Severity::Medium,
-                category: Category::ContentIntegrity,
-                title: "Timestamp Mismatch — Possible Post-Processing".into(),
-                description: "DateTimeOriginal and DateTime differ, indicating the image was modified after capture.".into(),
-                detail: Some(format!("Original: {}  |  Modified: {}", orig, modified)),
-                recommendation: "Verify the image chain of custody if authenticity matters.".into(),
-            });
+    // The exif crate renders DateTime values ISO-style while raw EXIF uses colons;
+    // accept both so the comparison works on real files.
+    let parse_dt = |s: &str| {
+        ["%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"]
+            .iter()
+            .find_map(|fmt| chrono::NaiveDateTime::parse_from_str(s.trim(), fmt).ok())
+    };
+    let original = timestamps.datetime_original.as_deref().and_then(parse_dt);
+    let digitized = timestamps.datetime_digitized.as_deref().and_then(parse_dt);
+    let modified = timestamps.datetime_modified.as_deref().and_then(parse_dt);
+    let times = [
+        ("DateTimeOriginal", original),
+        ("DateTimeDigitized", digitized),
+        ("DateTime", modified),
+    ];
+
+    let mut major: Option<(&str, chrono::NaiveDateTime, &str, chrono::NaiveDateTime, i64)> = None;
+    for i in 0..times.len() {
+        for j in (i + 1)..times.len() {
+            let (name_a, t_a) = times[i];
+            let (name_b, t_b) = times[j];
+            if let (Some(a), Some(b)) = (t_a, t_b) {
+                let diff = if a > b { a - b } else { b - a };
+                if diff.num_hours() > 24 {
+                    major = Some((name_a, a, name_b, b, diff.num_hours()));
+                }
+            }
         }
+    }
+
+    // TIME-003: sub-threshold mismatch between capture and modification time.
+    // A larger gap is reported by TIME-004 instead, avoiding duplicate findings.
+    if major.is_none() {
+        if let (Some(orig), Some(modif)) = (
+            &timestamps.datetime_original,
+            &timestamps.datetime_modified,
+        ) {
+            if orig != modif {
+                findings.push(SecurityFinding {
+                    id: "TIME-003".into(),
+                    severity: Severity::Medium,
+                    category: Category::ContentIntegrity,
+                    title: "Timestamp Mismatch — Possible Post-Processing".into(),
+                    description: "DateTimeOriginal and DateTime differ, indicating the image was modified after capture.".into(),
+                    detail: Some(format!("Original: {}  |  Modified: {}", orig, modif)),
+                    recommendation: "Verify the image chain of custody if authenticity matters.".into(),
+                });
+            }
+        }
+    }
+
+    // TIME-004: threshold-based timestamp inconsistency across DateTime fields.
+    if let Some((name_a, a, name_b, b, hours)) = major {
+        findings.push(SecurityFinding {
+            id: "TIME-004".into(),
+            severity: Severity::Medium,
+            category: Category::ContentIntegrity,
+            title: "Timestamp Inconsistency Detected".into(),
+            description: "EXIF timestamp fields disagree by more than 24 hours, suggesting the image may have been edited or its clock was misconfigured.".into(),
+            detail: Some(format!(
+                "{}: {}  |  {}: {}  (diff: {}h)",
+                name_a, a, name_b, b, hours
+            )),
+            recommendation: "Verify the image chain of custody if authenticity matters.".into(),
+        });
     }
 }
 
@@ -463,10 +586,99 @@ fn check_suspicious_fields(findings: &mut Vec<SecurityFinding>, raw_exif: &HashM
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
+static PHONE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b").expect("valid phone regex"));
+
+static EMAIL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b").expect("valid email regex")
+});
+
+static NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[A-Z][a-z]+ [A-Z][a-z]+\b").expect("valid name regex"));
+
+static VERSION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[\w\s]+\d+\.\d+\b").expect("valid version regex"));
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
         format!("{}… (truncated)", &s[..max])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn has(findings: &[SecurityFinding], id: &str) -> bool {
+        findings.iter().any(|f| f.id == id)
+    }
+
+    fn gps(lat_den: u32, lon_den: u32) -> Option<GpsInfo> {
+        Some(GpsInfo {
+            latitude_denominator: Some(lat_den),
+            longitude_denominator: Some(lon_den),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn gps_precision_flags_submeter_and_skips_coarse() {
+        let mut findings = Vec::new();
+        check_gps(&mut findings, &gps(1000, 1000));
+        assert!(has(&findings, "PREC-001"));
+
+        let mut findings = Vec::new();
+        check_gps(&mut findings, &gps(1, 1));
+        assert!(!has(&findings, "PREC-001"));
+    }
+
+    #[test]
+    fn timestamp_threshold_uses_time_004_without_duplicating_time_003() {
+        let timestamps = TimestampInfo {
+            datetime_original: Some("2024-01-01T12:00:00".into()),
+            datetime_modified: Some("2024-01-03 12:00:00".into()),
+            ..Default::default()
+        };
+        let mut findings = Vec::new();
+        check_timing(&mut findings, &timestamps);
+        assert!(has(&findings, "TIME-004"));
+        assert!(!has(&findings, "TIME-003"));
+    }
+
+    #[test]
+    fn timestamp_subthreshold_mismatch_uses_time_003() {
+        let timestamps = TimestampInfo {
+            datetime_original: Some("2024:01:01 12:00:00".into()),
+            datetime_modified: Some("2024-01-01 13:00:00".into()),
+            ..Default::default()
+        };
+        let mut findings = Vec::new();
+        check_timing(&mut findings, &timestamps);
+        assert!(has(&findings, "TIME-003"));
+        assert!(!has(&findings, "TIME-004"));
+    }
+
+    #[test]
+    fn user_comment_pii_is_detected() {
+        let software = SoftwareInfo {
+            user_comment: Some("Call 555-123-4567 or user@example.com".into()),
+            ..Default::default()
+        };
+        let mut findings = Vec::new();
+        check_personal_data(&mut findings, &software);
+        assert!(has(&findings, "PII-010"));
+    }
+
+    #[test]
+    fn plain_user_comment_does_not_trigger_pii() {
+        let software = SoftwareInfo {
+            user_comment: Some("Sunset over the bay".into()),
+            ..Default::default()
+        };
+        let mut findings = Vec::new();
+        check_personal_data(&mut findings, &software);
+        assert!(!has(&findings, "PII-010"));
     }
 }

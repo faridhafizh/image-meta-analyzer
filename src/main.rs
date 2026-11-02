@@ -37,7 +37,10 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    print_banner();
+    // Keep `--json` stdout machine-parseable; the banner would corrupt it.
+    if !args.json {
+        print_banner();
+    }
 
     let mut all_reports = Vec::new();
     let mut had_error = false;

@@ -8,11 +8,11 @@ A command-line tool written in **Rust** that extracts and audits EXIF/metadata f
 
 | Category | What It Detects |
 |---|---|
-| 📍 Location | GPS coordinates, altitude, speed, precise maps link |
+| 📍 Location | GPS coordinates, altitude, speed, sub-meter coordinate precision, precise maps link |
 | 🎥 Device ID | Camera make/model, serial numbers, lens info, MakerNote |
-| 👤 Personal Data | Artist name, user comments, host computer hostname, Windows XP tags |
-| 🛠 Software | Editing software fingerprint, document names / file paths |
-| ⏰ Timing | Capture timestamp, modification timestamp, timestamp mismatches |
+| 👤 Personal Data | Artist name, user comments (including phone/email/name PII), host computer hostname, Windows XP tags |
+| 🛠 Software | Editing software fingerprint, version numbers, document names / file paths |
+| ⏰ Timing | Capture timestamp, modification timestamp, sub-24h mismatches, >24h inconsistencies |
 | 🖼 Integrity | Embedded thumbnail leak, unique image ID tracking |
 | ⚠️ Format | Anomalous file formats, suspiciously small files |
 
@@ -24,7 +24,7 @@ Each finding is assigned a severity: **Info → Low → Medium → High → Crit
 
 ### Prerequisites
 
-- Rust toolchain (≥ 1.70): https://rustup.rs
+- Rust toolchain (≥ 1.80): https://rustup.rs
 
 ### Build
 
@@ -63,6 +63,9 @@ The binary will be at `target/release/image_meta_analyzer`.
 ```bash
 ./image_meta_analyzer photo.jpg --json
 ```
+
+JSON output is a parseable array (the banner is suppressed). Each report includes a
+`findings_summary` object with `total`, `by_severity`, and `by_category` counts.
 
 ### Save JSON report to file
 
@@ -157,6 +160,7 @@ convert photo.jpg -strip clean_photo.jpg
 - GIF
 - BMP
 - JPEG2000
+- HEIC / HEIF (detection and metadata analysis)
 
 ---
 
@@ -171,6 +175,7 @@ convert photo.jpg -strip clean_photo.jpg
 | `serde` / `serde_json` | JSON report serialization |
 | `sha2` / `md-5` | File integrity hashing |
 | `chrono` | Timestamp formatting |
+| `regex` | PII and software-version pattern detection |
 | `humansize` | Human-readable file sizes |
 | `hex` | Hash hex encoding |
 

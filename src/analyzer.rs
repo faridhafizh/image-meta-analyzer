@@ -30,8 +30,16 @@ pub struct ImageReport {
     pub raw_exif: HashMap<String, String>,
 
     pub security_findings: Vec<SecurityFinding>,
+    pub findings_summary: FindingsSummary,
     pub risk_level: String,
     pub risk_score: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct FindingsSummary {
+    pub total: u32,
+    pub by_severity: HashMap<String, u32>,
+    pub by_category: HashMap<String, u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -86,6 +94,8 @@ pub struct GpsInfo {
     pub altitude: Option<f64>,
     pub latitude_dms: String,
     pub longitude_dms: String,
+    pub latitude_denominator: Option<u32>,
+    pub longitude_denominator: Option<u32>,
     pub gps_timestamp: Option<String>,
     pub gps_datestamp: Option<String>,
     pub speed: Option<String>,
@@ -161,7 +171,6 @@ pub fn analyze_image(path: &Path, verbose: bool) -> Result<ImageReport, Box<dyn 
     let mut timestamps = TimestampInfo::default();
     let mut software_info = SoftwareInfo::default();
     let mut raw_exif: HashMap<String, String> = HashMap::new();
-
     if let Ok(exif) = exif_reader.read_from_container(&mut bufreader) {
         for field in exif.fields() {
             let tag_name = format!("{}", field.tag);
@@ -188,9 +197,7 @@ pub fn analyze_image(path: &Path, verbose: bool) -> Result<ImageReport, Box<dyn 
                 Tag::Model => camera_info.model = Some(value_str.clone()),
                 Tag::LensMake => camera_info.lens_make = Some(value_str.clone()),
                 Tag::LensModel => camera_info.lens_model = Some(value_str.clone()),
-                // Tag::BodySerialNumber => camera_info.body_serial = Some(value_str.clone()),
                 Tag::BodySerialNumber => camera_info.serial_number = Some(value_str.clone()),
-                // Tag::CameraSerialNumber => camera_info.serial_number = Some(value_str.clone()),
                 Tag::ExposureTime => camera_info.exposure_time = Some(value_str.clone()),
                 Tag::FNumber => camera_info.f_number = Some(value_str.clone()),
                 Tag::PhotographicSensitivity => camera_info.iso = Some(value_str.clone()),
@@ -214,9 +221,7 @@ pub fn analyze_image(path: &Path, verbose: bool) -> Result<ImageReport, Box<dyn 
                 Tag::Copyright => software_info.copyright = Some(value_str.clone()),
                 Tag::ImageDescription => software_info.image_description = Some(value_str.clone()),
                 Tag::UserComment => software_info.user_comment = Some(clean_user_comment(&field.value)),
-                // Tag::DocumentName => software_info.document_name = Some(value_str.clone()),
                 t if t.number() == 0x010d => software_info.document_name = Some(value_str.clone()),
-                // Tag::HostComputer => software_info.host_computer = Some(value_str.clone()),
                 t if t.number() == 0x013c => software_info.host_computer = Some(value_str.clone()),
 
                 // ── GPS ──────────────────────────────────────────────────────
@@ -257,6 +262,18 @@ pub fn analyze_image(path: &Path, verbose: bool) -> Result<ImageReport, Box<dyn 
     let risk_score = security_findings.iter().map(|f| f.severity.score()).sum();
     let risk_level = severity_label(risk_score);
 
+    let mut by_severity: HashMap<String, u32> = HashMap::new();
+    let mut by_category: HashMap<String, u32> = HashMap::new();
+    for f in &security_findings {
+        *by_severity.entry(f.severity.label().to_string()).or_insert(0) += 1;
+        *by_category.entry(f.category.to_string()).or_insert(0) += 1;
+    }
+    let findings_summary = FindingsSummary {
+        total: security_findings.len() as u32,
+        by_severity,
+        by_category,
+    };
+
     Ok(ImageReport {
         file_path: path.display().to_string(),
         file_name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
@@ -269,6 +286,7 @@ pub fn analyze_image(path: &Path, verbose: bool) -> Result<ImageReport, Box<dyn 
         software_info,
         raw_exif,
         security_findings,
+        findings_summary,
         risk_level,
         risk_score,
     })
@@ -279,11 +297,11 @@ pub fn analyze_image(path: &Path, verbose: bool) -> Result<ImageReport, Box<dyn 
 // ──────────────────────────────────────────────────────────────────────────────
 
 fn extract_gps(exif: &exif::Exif) -> Option<GpsInfo> {
-    let lat = rational_to_degrees(exif.get_field(Tag::GPSLatitude, In::PRIMARY)?)?;
+    let (lat, lat_denominator) = rational_to_degrees(exif.get_field(Tag::GPSLatitude, In::PRIMARY)?)?;
     let lat_ref = exif
         .get_field(Tag::GPSLatitudeRef, In::PRIMARY)
         .and_then(|f| ascii_value(&f.value));
-    let lon = rational_to_degrees(exif.get_field(Tag::GPSLongitude, In::PRIMARY)?)?;
+    let (lon, lon_denominator) = rational_to_degrees(exif.get_field(Tag::GPSLongitude, In::PRIMARY)?)?;
     let lon_ref = exif
         .get_field(Tag::GPSLongitudeRef, In::PRIMARY)
         .and_then(|f| ascii_value(&f.value));
@@ -315,6 +333,8 @@ fn extract_gps(exif: &exif::Exif) -> Option<GpsInfo> {
         altitude,
         latitude_dms: decimal_to_dms(lat_signed, true),
         longitude_dms: decimal_to_dms(lon_signed, false),
+        latitude_denominator: Some(lat_denominator),
+        longitude_denominator: Some(lon_denominator),
         gps_timestamp,
         gps_datestamp,
         speed,
@@ -326,13 +346,15 @@ fn extract_gps(exif: &exif::Exif) -> Option<GpsInfo> {
     })
 }
 
-fn rational_to_degrees(field: &exif::Field) -> Option<f64> {
-    if let Value::Rational(ref v) = field.value {
+/// Returns decimal degrees plus the denominator of the seconds component.
+/// That denominator is the coordinate resolution: `1/denom` arcseconds.
+fn rational_to_degrees(field: &exif::Field) -> Option<(f64, u32)> {
+    if let Value::Rational(v) = &field.value {
         if v.len() >= 3 {
             let deg = v[0].to_f64();
             let min = v[1].to_f64();
             let sec = v[2].to_f64();
-            return Some(deg + min / 60.0 + sec / 3600.0);
+            return Some((deg + min / 60.0 + sec / 3600.0, v[2].denom));
         }
     }
     None
@@ -378,6 +400,14 @@ fn detect_format(bytes: &[u8]) -> String {
         "WEBP".into()
     } else if bytes.starts_with(b"BM") {
         "BMP".into()
+    } else if bytes.len() >= 12
+        && &bytes[4..8] == b"ftyp"
+        && matches!(
+            &bytes[8..12],
+            b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis" | b"heif" | b"mif1" | b"msf1"
+        )
+    {
+        "HEIC".into()
     } else if bytes.starts_with(b"\x00\x00\x00\x0C\x6A\x50") {
         "JPEG2000".into()
     } else {
@@ -394,6 +424,7 @@ fn format_to_mime(fmt: &str) -> String {
         "WEBP" => "image/webp",
         "BMP" => "image/bmp",
         "JPEG2000" => "image/jp2",
+        "HEIC" => "image/heic",
         _ => "application/octet-stream",
     }
     .to_string()
